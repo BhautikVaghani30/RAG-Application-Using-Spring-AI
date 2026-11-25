@@ -2,41 +2,30 @@ package github.ai.backend.controllers;
 
 import java.util.Map;
 
-import org.springframework.http.ResponseEntity;
+import org.springframework.security.core.annotation.AuthenticationPrincipal;
 import org.springframework.web.bind.annotation.GetMapping;
 import org.springframework.web.bind.annotation.RequestMapping;
 import org.springframework.web.bind.annotation.RestController;
 
 import github.ai.backend.dto.UserResponse;
-import github.ai.backend.entity.User;
 import github.ai.backend.security.AppUserPrincipal;
-import github.ai.backend.security.CurrentUser;
-import lombok.RequiredArgsConstructor;
-
-
 
 @RestController
 @RequestMapping("/api/auth")
-@RequiredArgsConstructor
 public class AuthController {
-    private final CurrentUser currentUser;
+  @GetMapping("/login-url")
+  public Map<String, String> loginUrl() {
+    return Map.of("url", "/oauth2/authorization/github");
+  }
 
-    @GetMapping("/login-url")
-    public Map<String, String> loginUrl() {
-        return Map.of("url", "/oauth2/authorization/github");
-    }
-
-
-    @GetMapping("/me")
-    public ResponseEntity<UserResponse> me() {
-        AppUserPrincipal principal = currentUser.require();
-        User user = principal.getUser();
-        return ResponseEntity.ok(new UserResponse(
-                user.getId(),
-                user.getGithubId(),
-                user.getGithubUsername(),
-                user.getDisplayName(),
-                user.getAvatarUrl()));
-    }
-    
+  @GetMapping("/me")
+  public UserResponse me(@AuthenticationPrincipal AppUserPrincipal principal) {
+    var user = principal.getUser();
+    return new UserResponse(
+        user.getId(),
+        user.getGithubId(),
+        user.getGithubUsername(),
+        user.getDisplayName(),
+        user.getAvatarUrl());
+  }
 }

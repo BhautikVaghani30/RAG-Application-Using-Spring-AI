@@ -14,8 +14,7 @@ import github.ai.backend.entity.User;
 
 public class AppUserPrincipal implements OAuth2User {
 
-  @Getter
-  private final User user;
+  @Getter private final User user;
   private final Map<String, Object> attributes;
 
   public AppUserPrincipal(User user, Map<String, Object> attributes) {
@@ -27,7 +26,7 @@ public class AppUserPrincipal implements OAuth2User {
     return user.getId();
   }
 
-    @Override
+  @Override
   public @NonNull Map<String, Object> getAttributes() {
     return attributes;
   }

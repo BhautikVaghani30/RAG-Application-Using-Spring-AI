@@ -1,11 +1,10 @@
 package github.ai.backend.services;
 
-import java.util.List;
+import java.time.Instant;
 import java.util.UUID;
 
+import org.springframework.http.codec.ServerSentEvent;
 import org.springframework.stereotype.Service;
-import org.springframework.transaction.annotation.Transactional;
-import org.springframework.web.servlet.mvc.method.annotation.SseEmitter;
 
 import github.ai.backend.dto.ChatMessageResponse;
 import github.ai.backend.dto.ChatSessionResponse;
@@ -24,115 +23,115 @@ import github.ai.backend.services.ai.ChatStreamHandler;
 import github.ai.backend.services.ai.CitationMapper;
 import github.ai.backend.services.ai.CodeContextRetriever;
 import lombok.RequiredArgsConstructor;
+import reactor.core.publisher.Flux;
+import reactor.core.publisher.Mono;
+import reactor.core.scheduler.Schedulers;
 
-/**
- * Chat sessions and the RAG chat pipeline entry point.
- *
- * <p>{@link #streamReply} orchestrates the full flow:
- * validate → save user message → retrieve code context → build prompts → stream AI reply.
- * Each step is implemented in a dedicated class under {@code service.ai}.
- */
 @Service
 @RequiredArgsConstructor
 public class ChatService {
+  private final ChatSessionRepository chatSessionRepository;
+  private final ChatMessageRepository chatMessageRepository;
+  private final RepoService repoService;
+  private final CodeContextRetriever codeContextRetriever;
+  private final ChatPromptBuilder chatPromptBuilder;
+  private final ChatStreamHandler chatStreamHandler;
+  private final CitationMapper citationMapper;
 
-    private final ChatSessionRepository chatSessionRepository;
-    private final ChatMessageRepository chatMessageRepository;
-    private final RepoService repoService;
-    private final CodeContextRetriever codeContextRetriever;
-    private final ChatPromptBuilder chatPromptBuilder;
-    private final ChatStreamHandler chatStreamHandler;
-    private final CitationMapper citationMapper;
+  public Mono<ChatSessionResponse> createSession(UUID userId, CreateChatSessionRequest request) {
+    return repoService
+        .requireOwned(request.repositoryId(), userId)
+        .flatMap(repo -> {
+          if (repo.getIndexStatus() != IndexStatus.READY) {
+            return Mono.error(
+                new BadRequestException("Repository must be indexed before chatting"));
+          }
+          String title =
+              request.title() == null || request.title().isBlank()
+                  ? "Chat with " + repo.getFullName()
+                  : request.title();
+          ChatSession session =
+              ChatSession.builder()
+                  .userId(userId)
+                  .repositoryId(repo.getId())
+                  .title(title)
+                  .createdAt(Instant.now())
+                  .build();
+          return chatSessionRepository.save(session).map(this::toSessionResponse);
+        });
+  }
 
-    @Transactional
-    public ChatSessionResponse createSession(UUID userId, CreateChatSessionRequest request) {
-        Repository repo = repoService.requireOwned(request.repositoryId(), userId);
-        if (repo.getIndexStatus() != IndexStatus.READY) {
-            throw new BadRequestException("Repository must be indexed before chatting");
-        }
+  public Flux<ChatSessionResponse> listSessions(UUID userId, UUID repositoryId) {
+    return repoService
+        .requireOwned(repositoryId, userId)
+        .flatMapMany(repo ->
+            chatSessionRepository.findByUserIdAndRepositoryIdOrderByCreatedAtDesc(
+                userId, repositoryId))
+        .map(this::toSessionResponse);
+  }
 
-        String title = request.title() != null && !request.title().isBlank()
-                ? request.title()
-                : "Chat with " + repo.getFullName();
+  public Flux<ChatMessageResponse> getMessages(UUID userId, UUID sessionId) {
+    return requireSession(userId, sessionId)
+        .flatMapMany(
+            session -> chatMessageRepository.findBySessionIdOrderByCreatedAtAsc(session.getId()))
+        .map(this::toMessageResponse);
+  }
 
-        ChatSession session = ChatSession.builder()
-                .userId(userId)
-                .repositoryId(repo.getId())
-                .title(title)
-                .build();
-        session = chatSessionRepository.save(session);
-        return toSessionResponse(session);
-    }
+  public Mono<ChatSession> requireSession(UUID userId, UUID sessionId) {
+    return chatSessionRepository
+        .findByIdAndUserId(sessionId, userId)
+        .switchIfEmpty(Mono.error(new NotFoundException("Chat session not found")));
+  }
 
-    @Transactional(readOnly = true)
-    public List<ChatSessionResponse> listSessions(UUID userId, UUID repositoryId) {
-        repoService.requireOwned(repositoryId, userId);
-        return chatSessionRepository
-                .findByUserIdAndRepositoryIdOrderByCreatedAtDesc(userId, repositoryId)
-                .stream()
-                .map(this::toSessionResponse)
-                .toList();
-    }
+  public Flux<ServerSentEvent<Object>> streamReply(
+      UUID userId, UUID sessionId, String userContent) {
+    return requireSession(userId, sessionId)
+        .flatMap(session ->
+            repoService
+                .requireOwned(session.getRepositoryId(), userId)
+                .flatMap(repo -> {
+                  if (repo.getIndexStatus() != IndexStatus.READY) {
+                    return Mono.error(new BadRequestException("Repository is not ready for chat"));
+                  }
+                  ChatMessage userMessage =
+                      ChatMessage.builder()
+                          .sessionId(session.getId())
+                          .role(MessageRole.USER)
+                          .content(userContent)
+                          .createdAt(Instant.now())
+                          .build();
+                  return chatMessageRepository
+                      .save(userMessage)
+                      .map(saved -> new ChatRequestContext(session, repo, saved));
+                }))
+        .flatMapMany(context ->
+            Mono.fromCallable(
+                    () -> codeContextRetriever.retrieve(context.repository().getId(), userContent))
+                .subscribeOn(Schedulers.boundedElastic())
+                .flatMapMany(retrievedContext ->
+                    chatStreamHandler.stream(
+                        context.session().getId(),
+                        toMessageResponse(context.userMessage()),
+                        retrievedContext.citations(),
+                        chatPromptBuilder.systemPrompt(context.repository().getFullName()),
+                        chatPromptBuilder.userPrompt(
+                            retrievedContext.contextText(), userContent))));
+  }
 
-    @Transactional(readOnly = true)
-    public List<ChatMessageResponse> getMessages(UUID userId, UUID sessionId) {
-        ChatSession session = requireSession(userId, sessionId);
-        return chatMessageRepository.findBySessionIdOrderByCreatedAtAsc(session.getId()).stream()
-                .map(this::toMessageResponse)
-                .toList();
-    }
+  private ChatSessionResponse toSessionResponse(ChatSession session) {
+    return new ChatSessionResponse(
+        session.getId(), session.getRepositoryId(), session.getTitle(), session.getCreatedAt());
+  }
 
-    @Transactional(readOnly = true)
-    public ChatSession requireSession(UUID userId, UUID sessionId) {
-        return chatSessionRepository.findByIdAndUserId(sessionId, userId)
-                .orElseThrow(() -> new NotFoundException("Chat session not found"));
-    }
+  private ChatMessageResponse toMessageResponse(ChatMessage message) {
+    return new ChatMessageResponse(
+        message.getId(),
+        message.getRole(),
+        message.getContent(),
+        citationMapper.fromJson(message.getCitations()),
+        message.getCreatedAt());
+  }
 
-    public SseEmitter streamReply(UUID userId, UUID sessionId, String userContent) {
-        // 1. Ensure the session exists and the repo is indexed
-        ChatSession session = requireSession(userId, sessionId);
-        Repository repo = repoService.requireOwned(session.getRepositoryId(), userId);
-        if (repo.getIndexStatus() != IndexStatus.READY) {
-            throw new BadRequestException("Repository is not ready for chat");
-        }
-
-        // 2. Persist the user's message
-        ChatMessage userMessage = chatMessageRepository.save(ChatMessage.builder()
-                .sessionId(session.getId())
-                .role(MessageRole.USER)
-                .content(userContent)
-                .build());
-
-        // 3. RAG retrieval — find code chunks similar to the question
-        var retrievedContext = codeContextRetriever.retrieve(repo.getId(), userContent);
-
-        // 4. Build LLM prompts from retrieved context + question
-        String systemPrompt = chatPromptBuilder.systemPrompt(repo.getFullName());
-        String userPrompt = chatPromptBuilder.userPrompt(retrievedContext.contextText(), userContent);
-
-        // 5. Stream OpenAI response to the client (SSE)
-        return chatStreamHandler.stream(
-                session.getId(),
-                toMessageResponse(userMessage),
-                retrievedContext.citations(),
-                systemPrompt,
-                userPrompt);
-    }
-
-    private ChatSessionResponse toSessionResponse(ChatSession session) {
-        return new ChatSessionResponse(
-                session.getId(),
-                session.getRepositoryId(),
-                session.getTitle(),
-                session.getCreatedAt());
-    }
-
-    private ChatMessageResponse toMessageResponse(ChatMessage message) {
-        return new ChatMessageResponse(
-                message.getId(),
-                message.getRole(),
-                message.getContent(),
-                citationMapper.fromJson(message.getCitations()),
-                message.getCreatedAt());
-    }
+  private record ChatRequestContext(
+      ChatSession session, Repository repository, ChatMessage userMessage) {}
 }

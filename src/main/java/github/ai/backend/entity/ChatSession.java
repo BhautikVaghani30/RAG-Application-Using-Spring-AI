@@ -3,21 +3,16 @@ package github.ai.backend.entity;
 import java.time.Instant;
 import java.util.UUID;
 
-import jakarta.persistence.Column;
-import jakarta.persistence.Entity;
-import jakarta.persistence.GeneratedValue;
-import jakarta.persistence.GenerationType;
-import jakarta.persistence.Id;
-import jakarta.persistence.PrePersist;
-import jakarta.persistence.Table;
+import org.springframework.data.annotation.Id;
+import org.springframework.data.relational.core.mapping.Column;
+import org.springframework.data.relational.core.mapping.Table;
 import lombok.AllArgsConstructor;
 import lombok.Builder;
 import lombok.Getter;
 import lombok.NoArgsConstructor;
 import lombok.Setter;
 
-@Entity
-@Table(name = "chat_sessions")
+@Table("chat_sessions")
 @Getter
 @Setter
 @NoArgsConstructor
@@ -25,29 +20,16 @@ import lombok.Setter;
 @Builder
 public class ChatSession {
 
-    @Id
-    @GeneratedValue(strategy = GenerationType.UUID)
-    private UUID id;
+  @Id private UUID id;
 
-    @Column(name = "user_id", nullable = false)
-    private UUID userId;
+  @Column("user_id")
+  private UUID userId;
 
-    @Column(name = "repository_id", nullable = false)
-    private UUID repositoryId;
+  @Column("repository_id")
+  private UUID repositoryId;
 
-    @Column(nullable = false, length = 200)
-    private String title;
+  private String title;
 
-    @Column(name = "created_at", nullable = false, updatable = false)
-    private Instant createdAt;
-
-    @PrePersist
-    void onCreate() {
-        if (createdAt == null) {
-            createdAt = Instant.now();
-        }
-        if (title == null || title.isBlank()) {
-            title = "New chat";
-        }
-    }
+  @Column("created_at")
+  private Instant createdAt;
 }

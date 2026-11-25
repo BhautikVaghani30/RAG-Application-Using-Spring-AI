@@ -3,6 +3,9 @@ package github.ai.backend.services.github;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Component;
 
+import java.time.Duration;
+import reactor.core.publisher.Mono;
+
 /** Simple delay helper to stay under GitHub API secondary rate limits during indexing. */
 @Component
 public class GitHubRateLimiter {
@@ -13,15 +16,10 @@ public class GitHubRateLimiter {
     this.delayMs = Math.max(0, delayMs);
   }
 
-  public void pause() {
+  public Mono<Void> pause() {
     if (delayMs <= 0) {
-      return;
+      return Mono.empty();
     }
-    try {
-      Thread.sleep(delayMs);
-    } catch (InterruptedException e) {
-      Thread.currentThread().interrupt();
-      throw new IllegalStateException("Interrupted while rate limiting", e);
-    }
+    return Mono.delay(Duration.ofMillis(delayMs)).then();
   }
 }

@@ -1,15 +1,15 @@
 package github.ai.backend.repository;
 
-import java.util.List;
-import java.util.Optional;
 import java.util.UUID;
 
-import org.springframework.data.jpa.repository.JpaRepository;
+import org.springframework.data.repository.reactive.ReactiveCrudRepository;
 
 import github.ai.backend.entity.ChatSession;
+import reactor.core.publisher.Flux;
+import reactor.core.publisher.Mono;
 
-public interface ChatSessionRepository extends JpaRepository<ChatSession, UUID> {
-    List<ChatSession> findByUserIdAndRepositoryIdOrderByCreatedAtDesc(UUID userId, UUID repositoryId);
+public interface ChatSessionRepository extends ReactiveCrudRepository<ChatSession, UUID> {
+  Flux<ChatSession> findByUserIdAndRepositoryIdOrderByCreatedAtDesc(UUID userId, UUID repositoryId);
 
-    Optional<ChatSession> findByIdAndUserId(UUID id, UUID userId);
+  Mono<ChatSession> findByIdAndUserId(UUID id, UUID userId);
 }

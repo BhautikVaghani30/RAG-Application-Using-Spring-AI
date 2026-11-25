@@ -28,14 +28,14 @@
 
 ## Overview & Capabilities
 
-**GithubAiBackend** is an enterprise-grade backend service that turns any GitHub repository into an interactive, context-aware AI assistant. Developers can authenticate through GitHub, select any repository (public or private), automatically index and embed the code tree into a vector database, and chat with an LLM in real-time about their code with source file citations and line-accurate references.
+**GithubAiBackend** is a reactive backend service that turns GitHub repositories into an interactive, context-aware AI assistant. Developers authenticate through GitHub, select a repository, index its code into a vector database, and chat with an LLM using server-sent events.
 
 ### Key Capabilities
 
 - **Seamless GitHub OAuth2 Integration**: Secure GitHub login requesting `read:user,repo` scopes, with automated user synchronization.
 - **At-Rest Token Encryption**: GitHub access tokens are symmetrically encrypted via AES before being written to PostgreSQL and decrypted in memory only when calling GitHub APIs.
 - **Smart Code Filtering & Parsing**: Excludes lockfiles, binaries, vendor folders (`node_modules`, `target`, `dist`, `.git`), and large files (>100KB), while indexing 40+ programming languages and configuration formats.
-- **Asynchronous Vector Indexing**: Parallel background job processing using Spring's `ThreadPoolTaskExecutor`, generating token-based chunks with file metadata and storing 1536-dimensional embeddings in `pgvector`.
+- **Asynchronous Vector Indexing**: Reactor pipelines fetch and process repository files without blocking request threads, generating token-based chunks and storing 1536-dimensional embeddings in `pgvector`.
 - **RAG-Powered Semantic Search**: High-precision vector similarity search fetching the top 8 most relevant code blocks per prompt.
 - **Real-Time Token Streaming via SSE**: Server-Sent Events (`text/event-stream`) streaming partial tokens dynamically from OpenAI `gpt-4o-mini` with instant response delivery and final citation payload.
 
@@ -121,14 +121,14 @@ flowchart TD
 | Layer | Component | Description |
 | :--- | :--- | :--- |
 | **Language & Runtime** | Java 21 LTS | Utilizes modern Java records, virtual-thread readiness, and enhanced pattern matching |
-| **Application Framework**| Spring Boot 4.1.0 | Core inversion-of-control, MVC, and dependency injection container |
+| **Application Framework**| Spring Boot 4.1.0 + WebFlux | Reactive HTTP endpoints, security, and dependency injection |
 | **AI Framework** | Spring AI 2.0.0 | High-level abstraction for OpenAI models and vector stores (`spring-ai-starter-model-openai`) |
 | **Vector Store** | PostgreSQL + `pgvector` | Native relational database vector store with cosine/L2 distance search (`spring-ai-starter-vector-store-pgvector`) |
-| **Database & ORM** | PostgreSQL & Spring Data JPA | Relational data persistence with Hibernate ORM, UUID primary keys, and connection pooling |
-| **Security & OAuth2** | Spring Security & OAuth2 Client | GitHub OAuth2 authorization flow, session cookies (`GITHUBAI_SESSION`), and CORS filter |
+| **Database** | PostgreSQL, Spring Data R2DBC, and pgvector | Reactive relational persistence; vector-store JDBC calls are isolated on Reactor's bounded elastic scheduler |
+| **Security & OAuth2** | Spring Security & OAuth2 Client | Reactive GitHub OAuth2 authorization flow, WebSession, and CORS filter |
 | **Cryptography** | Spring Security Crypto | AES encryption via `TextEncryptor` for GitHub personal access tokens |
-| **HTTP Client** | Spring `RestClient` | Modern synchronous HTTP client with base URL, headers, and rate limiting |
-| **Real-time Comms** | Spring Web MVC `SseEmitter` | Server-Sent Events (SSE) streaming tokens directly to web clients |
+| **HTTP Client** | Spring `WebClient` | Non-blocking GitHub REST API requests |
+| **Real-time Comms** | Reactor `Flux` + WebFlux SSE | Backpressure-aware Server-Sent Events streaming |
 | **Boilerplate Reduction**| Project Lombok | `@Getter`, `@Setter`, `@Builder`, `@RequiredArgsConstructor`, and `@Slf4j` |
 
 ---
@@ -250,7 +250,7 @@ sequenceDiagram
     DB -->> UserSvc: User Entity
     UserSvc -->> GHService: User
     GHService -->> Sec: AppUserPrincipal
-    Sec ->> Sec: Generate HTTP Session (GITHUBAI_SESSION cookie)
+    Sec ->> Sec: Generate reactive WebSession cookie
     Sec -->> User: Redirect to ${app.frontend-url}/auth/callback
     User ->> Client: Load Callback Page
     Client ->> AuthCtrl: GET /api/auth/me (Cookie attached)
@@ -262,7 +262,7 @@ sequenceDiagram
 - Client issues `POST /api/auth/logout`.
 - Session is invalidated (`invalidateHttpSession(true)`).
 - `SecurityContext` is purged.
-- Cookie `GITHUBAI_SESSION` is deleted.
+- The reactive WebSession is invalidated.
 - Responds with `204 No Content`.
 
 ---
@@ -314,7 +314,7 @@ sequenceDiagram
 
 ### Flow 3: Asynchronous Code Indexing & Embedding Pipeline
 
-When a user initiates repository indexing, the work runs asynchronously on a dedicated thread pool (`indexingExecutor`), freeing the HTTP request immediately (`202 Accepted`).
+When a user initiates repository indexing, the reactive indexing pipeline is queued independently of the HTTP request, which returns `202 Accepted` immediately. GitHub calls and R2DBC persistence are non-blocking; synchronous pgvector operations are isolated on Reactor's bounded elastic scheduler.
 
 ```mermaid
 flowchart TD
@@ -324,7 +324,7 @@ flowchart TD
     CheckStatus -- No --> SetIndexingState["Set status = INDEXING\nReset counts to 0\nSave to DB"]
     SetIndexingState --> ReturnAccepted["Return 202 Accepted with RepositoryResponse"]
     
-    ReturnAccepted -.-> AsyncTrigger[["Async Execution on 'indexingExecutor' Pool"]]
+    ReturnAccepted -.-> AsyncTrigger[["Reactive indexing pipeline"]]
     
     subgraph AsyncPipeline["Background Indexing Thread"]
         GetToken["Retrieve & Decrypt User GitHub Access Token"] --> DeleteVectors["Delete Previous Vectors\n(Filter: repoId == currentRepoId)"]
@@ -447,7 +447,7 @@ sequenceDiagram
     PromptBld -->> ChatSvc: "Code context:\n...\nUser question:\n..."
 
     ChatSvc ->> StreamHnd: stream(sessionId, userMsgDto, citations, systemPrompt, userPrompt)
-    StreamHnd ->> StreamHnd: Initialize SseEmitter(timeout = 180s)
+    StreamHnd ->> StreamHnd: Create a backpressure-aware Flux of SSE events
     StreamHnd -->> Client: HTTP 200 OK (Connection: keep-alive, Content-Type: text/event-stream)
 
     StreamHnd ->> Client: SSE Event: name="user_message", data=savedUserMessage
@@ -491,7 +491,7 @@ flowchart LR
     subgraph Authentication["Session Authentication"]
         Filter --> CheckPermit{"Public Route?\n(/api/auth/login-url,\n/oauth2/**)"}
         CheckPermit -- Yes --> Allow["Permit Request"]
-        CheckPermit -- No --> CheckSession{"Valid Session Cookie\n(GITHUBAI_SESSION)?"}
+        CheckPermit -- No --> CheckSession{"Valid reactive WebSession?"}
         CheckSession -- No --> Err401["Return 401 Unauthorized\n(HttpStatusEntryPoint)"]
         CheckSession -- Yes --> ResolvePrincipal["Resolve AppUserPrincipal\nvia CurrentUser.require()"]
     end
@@ -554,7 +554,7 @@ flowchart TD
 
 #### `GET /api/auth/me`
 - **Description**: Retrieves the profile of the currently logged-in user.
-- **Authentication**: Required (`GITHUBAI_SESSION` cookie).
+- **Authentication**: Required (reactive WebSession cookie).
 - **Response `200 OK`**:
   ```json
   {
@@ -720,17 +720,18 @@ All settings are externally configurable via environment variables or `applicati
 | Property | Environment Variable | Default Value | Purpose |
 | :--- | :--- | :--- | :--- |
 | `server.port` | `SERVER_PORT` | `8080` | Port the backend server listens on |
-| `spring.datasource.url` | `DATABASE_URL` | `jdbc:postgresql://localhost:5433/githubai` | JDBC Connection String |
+| `spring.r2dbc.url` | `DATABASE_R2DBC_URL` | `r2dbc:postgresql://localhost:5433/githubai` | Reactive database connection |
+| `spring.datasource.url` | `DATABASE_URL` | `jdbc:postgresql://localhost:5433/githubai` | JDBC connection used by Spring AI pgvector |
 | `spring.datasource.username` | `DATABASE_USERNAME` | `postgres` | PostgreSQL username |
 | `spring.datasource.password` | `DATABASE_PASSWORD` | `postgres` | PostgreSQL password |
-| `spring.security.oauth2.client.registration.github.client-id` | `GITHUB_CLIENT_ID` | `Ov23li9bZ61FsKX4oaZB` | GitHub OAuth App Client ID |
-| `spring.security.oauth2.client.registration.github.client-secret` | `GITHUB_CLIENT_SECRET` | *(secret)* | GitHub OAuth App Client Secret |
+| `spring.security.oauth2.client.registration.github.client-id` | `GITHUB_CLIENT_ID` | *(required)* | GitHub OAuth App Client ID |
+| `spring.security.oauth2.client.registration.github.client-secret` | `GITHUB_CLIENT_SECRET` | *(required)* | GitHub OAuth App Client Secret |
 | `spring.ai.openai.api-key` | `OPENAI_API_KEY` | *(required)* | OpenAI API secret key |
 | `spring.ai.openai.chat.options.model` | `OPENAI_CHAT_MODEL` | `gpt-4o-mini` | Chat completion model |
 | `spring.ai.openai.embedding.options.model` | `OPENAI_EMBEDDING_MODEL`| `text-embedding-3-small` | 1536-dimensional embedding model |
 | `app.frontend-url` | `FRONTEND_URL` | `http://localhost:3000` | Redirect target for OAuth callbacks |
 | `app.cors.allowed-origins` | `CORS_ALLOWED_ORIGINS` | `http://localhost:3000` | Allowed origins for cross-origin requests |
-| `app.token-encryptor-password` | `TOKEN_ENCRYPTOR_PASSWORD` | *(secret key)* | Master password for token AES encryption |
+| `app.token-encryptor-password` | `TOKEN_ENCRYPTOR_PASSWORD` | *(required)* | Stable master password for token AES encryption; changing it invalidates stored encrypted tokens |
 | `app.token-encryptor-salt` | `TOKEN_ENCRYPTOR_SALT` | `5c0744940b5c369b` | Hex-encoded salt for AES key derivation |
 | `app.github.api-delay-ms` | `GITHUB_API_DELAY_MS` | `50` | Artificial delay between GitHub API calls (ms) |
 | `app.indexing.chunk-size` | `INDEXING_CHUNK_SIZE` | `800` | Character size per code chunk |
@@ -767,14 +768,16 @@ docker ps
 The database runs on port `5433` with user `postgres` and password `postgres`.
 
 ### 4. Export Required Environment Variables
-In your terminal (PowerShell or Bash):
+In your terminal (PowerShell or Bash), configure both database drivers to point to the same PostgreSQL database:
 
 **PowerShell (Windows)**:
 ```powershell
 $env:OPENAI_API_KEY="sk-your-openai-key-here"
 $env:GITHUB_CLIENT_ID="your_github_client_id"
 $env:GITHUB_CLIENT_SECRET="your_github_client_secret"
+$env:TOKEN_ENCRYPTOR_PASSWORD="a-long-random-secret"
 $env:DATABASE_URL="jdbc:postgresql://localhost:5433/devpilot"
+$env:DATABASE_R2DBC_URL="r2dbc:postgresql://localhost:5433/devpilot"
 ```
 
 **Bash / macOS / Linux**:
@@ -782,7 +785,9 @@ $env:DATABASE_URL="jdbc:postgresql://localhost:5433/devpilot"
 export OPENAI_API_KEY="sk-your-openai-key-here"
 export GITHUB_CLIENT_ID="your_github_client_id"
 export GITHUB_CLIENT_SECRET="your_github_client_secret"
+export TOKEN_ENCRYPTOR_PASSWORD="a-long-random-secret"
 export DATABASE_URL="jdbc:postgresql://localhost:5433/devpilot"
+export DATABASE_R2DBC_URL="r2dbc:postgresql://localhost:5433/devpilot"
 ```
 
 ### 5. Build and Run the Backend Service
@@ -816,7 +821,7 @@ backend/
     │   ├── java/github/ai/backend/
     │   │   ├── BackendApplication.java   # Spring Boot entry point
     │   │   ├── config/                   # Configuration beans
-    │   │   │   ├── AppConfig.java        # RestClient & ThreadPoolTaskExecutor
+    │   │   │   ├── AppConfig.java        # WebClient builder
     │   │   │   ├── CorsConfig.java       # Cross-Origin Resource Sharing setup
     │   │   │   ├── CryptoConfig.java     # TextEncryptor AES token encryptor
     │   │   │   └── SecurityConfig.java   # Security filter chain & OAuth2 handlers
@@ -833,7 +838,7 @@ backend/
     │   │   │   ├── IndexStatusResponse.java
     │   │   │   ├── RepositoryResponse.java
     │   │   │   └── UserResponse.java
-    │   │   ├── entity/                   # JPA Entity domain models
+    │   │   ├── entity/                   # Spring Data Relational domain models
     │   │   │   ├── ChatMessage.java
     │   │   │   ├── ChatSession.java
     │   │   │   ├── IndexStatus.java
@@ -845,7 +850,7 @@ backend/
     │   │   │   ├── GlobalExceptionHandler.java
     │   │   │   ├── NotFoundException.java
     │   │   │   └── UnauthorizedException.java
-    │   │   ├── repository/               # Spring Data JPA Repositories
+    │   │   ├── repository/               # Reactive Spring Data R2DBC repositories
     │   │   │   ├── ChatMessageRepository.java
     │   │   │   ├── ChatSessionRepository.java
     │   │   │   ├── RepositoryRepository.java
@@ -873,7 +878,8 @@ backend/
     │   │           ├── CodeFileFilter.java
     │   │           └── IndexingService.java
     │   └── resources/
-    │       └── application.properties    # Central configuration file
+    │       ├── application.properties    # Central configuration file
+    │       └── schema.sql                # Idempotent relational schema initialization
     └── test/
         └── java/github/ai/backend/
             └── BackendApplicationTests.java

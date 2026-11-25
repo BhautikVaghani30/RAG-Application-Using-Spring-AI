@@ -1,17 +1,17 @@
 package github.ai.backend.repository;
 
-import java.util.List;
-import java.util.Optional;
 import java.util.UUID;
 
-import org.springframework.data.jpa.repository.JpaRepository;
+import org.springframework.data.repository.reactive.ReactiveCrudRepository;
 
 import github.ai.backend.entity.Repository;
+import reactor.core.publisher.Flux;
+import reactor.core.publisher.Mono;
 
-public interface RepositoryRepository extends JpaRepository<Repository, UUID> {
-    List<Repository> findByUserIdOrderByFullNameAsc(UUID userId);
+public interface RepositoryRepository extends ReactiveCrudRepository<Repository, UUID> {
+  Flux<Repository> findByUserIdOrderByFullNameAsc(UUID userId);
 
-    Optional<Repository> findByIdAndUserId(UUID id, UUID userId);
+  Mono<Repository> findByIdAndUserId(UUID id, UUID userId);
 
-    Optional<Repository> findByUserIdAndGithubRepoId(UUID userId, Long githubRepoId);
+  Mono<Repository> findByUserIdAndGithubRepoId(UUID userId, Long githubRepoId);
 }

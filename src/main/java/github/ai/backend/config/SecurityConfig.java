@@ -5,78 +5,68 @@ import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
 import org.springframework.http.HttpMethod;
 import org.springframework.http.HttpStatus;
+import org.springframework.security.authentication.ReactiveAuthenticationManager;
 import org.springframework.security.config.Customizer;
-import org.springframework.security.config.annotation.web.builders.HttpSecurity;
-import org.springframework.security.config.annotation.web.configuration.EnableWebSecurity;
-import org.springframework.security.config.http.SessionCreationPolicy;
-import org.springframework.security.web.SecurityFilterChain;
-import org.springframework.security.web.authentication.AuthenticationFailureHandler;
-import org.springframework.security.web.authentication.AuthenticationSuccessHandler;
-import org.springframework.security.web.authentication.HttpStatusEntryPoint;
-import org.springframework.security.web.authentication.SimpleUrlAuthenticationFailureHandler;
-import org.springframework.security.web.authentication.SimpleUrlAuthenticationSuccessHandler;
+import org.springframework.security.config.web.server.ServerHttpSecurity;
+import org.springframework.security.oauth2.client.authentication.OAuth2LoginReactiveAuthenticationManager;
+import org.springframework.security.oauth2.client.endpoint.WebClientReactiveAuthorizationCodeTokenResponseClient;
+import org.springframework.security.web.server.SecurityWebFilterChain;
+import org.springframework.security.web.server.authentication.RedirectServerAuthenticationFailureHandler;
+import org.springframework.security.web.server.authentication.RedirectServerAuthenticationSuccessHandler;
 
 import github.ai.backend.security.GithubOAuth2UserService;
 import lombok.RequiredArgsConstructor;
 
 @Configuration
-@EnableWebSecurity
 @RequiredArgsConstructor
 public class SecurityConfig {
+  private final GithubOAuth2UserService gitHubOAuth2UserService;
 
-    private final GithubOAuth2UserService gitHubOAuth2UserService;
+  @Bean
+  ReactiveAuthenticationManager githubOAuth2LoginAuthenticationManager() {
+    return new OAuth2LoginReactiveAuthenticationManager(
+        new WebClientReactiveAuthorizationCodeTokenResponseClient(), gitHubOAuth2UserService);
+  }
 
-    @Bean
-    SecurityFilterChain securityFilterChain(
-            HttpSecurity http,
-            AuthenticationSuccessHandler oauth2SuccessHandler,
-            AuthenticationFailureHandler oauth2FailureHandler) throws Exception {
-        http
-                .cors(Customizer.withDefaults())
-                .csrf(csrf -> csrf.disable())
-                .sessionManagement(session -> session
-                        .sessionCreationPolicy(SessionCreationPolicy.IF_REQUIRED))
-                .authorizeHttpRequests(auth -> auth
-                        .requestMatchers(
-                                "/api/auth/login-url",
-                                "/oauth2/**",
-                                "/login/oauth2/**",
-                                "/error")
-                        .permitAll()
-                        .requestMatchers(HttpMethod.OPTIONS, "/**").permitAll()
-                        .requestMatchers("/api/**").authenticated()
-                        .anyRequest().permitAll())
-                .exceptionHandling(ex -> ex
-                        .authenticationEntryPoint(new HttpStatusEntryPoint(HttpStatus.UNAUTHORIZED)))
-                .oauth2Login(oauth -> oauth
-                        .userInfoEndpoint(userInfo -> userInfo
-                                .userService(gitHubOAuth2UserService))
-                        .successHandler(oauth2SuccessHandler)
-                        .failureHandler(oauth2FailureHandler))
-                .logout(logout -> logout
-                        .logoutUrl("/api/auth/logout")
-                        .logoutSuccessHandler((request, response, authentication) ->
-                                response.setStatus(HttpStatus.NO_CONTENT.value()))
-                        .invalidateHttpSession(true)
-                        .clearAuthentication(true)
-                        .deleteCookies("GITHUBAI_SESSION"));
+  @Bean
+  SecurityWebFilterChain securityWebFilterChain(
+      ServerHttpSecurity http,
+      ReactiveAuthenticationManager githubOAuth2LoginAuthenticationManager,
+      @Value("${app.frontend-url}") String frontendUrl) {
+    RedirectServerAuthenticationSuccessHandler successHandler =
+        new RedirectServerAuthenticationSuccessHandler(frontendUrl + "/auth/callback");
+    RedirectServerAuthenticationFailureHandler failureHandler =
+        new RedirectServerAuthenticationFailureHandler(frontendUrl + "/login?error=oauth_failed");
 
-        return http.build();
-    }
-
-    @Bean
-    AuthenticationSuccessHandler oauth2SuccessHandler(
-            @Value("${app.frontend-url}") String frontendUrl) {
-        SimpleUrlAuthenticationSuccessHandler handler = new SimpleUrlAuthenticationSuccessHandler();
-        handler.setDefaultTargetUrl(frontendUrl + "/auth/callback");
-        return handler;
-    }
-
-    @Bean
-    AuthenticationFailureHandler oauth2FailureHandler(
-            @Value("${app.frontend-url}") String frontendUrl) {
-        SimpleUrlAuthenticationFailureHandler handler = new SimpleUrlAuthenticationFailureHandler();
-        handler.setDefaultFailureUrl(frontendUrl + "/login?error=oauth_failed");
-        return handler;
-    }
+    return http.cors(Customizer.withDefaults())
+        .csrf(ServerHttpSecurity.CsrfSpec::disable)
+        .authorizeExchange(exchange ->
+            exchange
+                .pathMatchers("/api/auth/login-url", "/oauth2/**", "/login/oauth2/**", "/error")
+                .permitAll()
+                .pathMatchers(HttpMethod.OPTIONS, "/**")
+                .permitAll()
+                .pathMatchers("/api/**")
+                .authenticated()
+                .anyExchange()
+                .permitAll())
+        .exceptionHandling(errors ->
+            errors.authenticationEntryPoint((exchange, exception) -> {
+              exchange.getResponse().setStatusCode(HttpStatus.UNAUTHORIZED);
+              return exchange.getResponse().setComplete();
+            }))
+        .oauth2Login(oauth2 ->
+            oauth2
+                .authenticationManager(githubOAuth2LoginAuthenticationManager)
+                .authenticationSuccessHandler(successHandler)
+                .authenticationFailureHandler(failureHandler))
+        .logout(logout ->
+            logout
+                .logoutUrl("/api/auth/logout")
+                .logoutSuccessHandler((exchange, authentication) -> {
+                  exchange.getExchange().getResponse().setStatusCode(HttpStatus.NO_CONTENT);
+                  return exchange.getExchange().getResponse().setComplete();
+                }))
+        .build();
+  }
 }

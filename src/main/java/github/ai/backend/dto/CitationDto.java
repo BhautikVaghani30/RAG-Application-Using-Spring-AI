@@ -1,8 +1,3 @@
 package github.ai.backend.dto;
 
-public record CitationDto(
-        String filePath,
-        Integer startLine,
-        Integer endLine,
-        String language) {
-}
+public record CitationDto(String filePath, Integer startLine, Integer endLine, String language) {}
